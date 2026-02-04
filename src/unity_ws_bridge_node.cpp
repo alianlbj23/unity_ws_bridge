@@ -236,16 +236,16 @@ private:
 
   bool parse_and_publish_lidar(const uint8_t* p, std::size_t len)
   {
-    if (len < 12) return false;
+    if (len < 10) return false;
 
     const uint32_t magic = read_u32_le(p + 0);
     if (magic != MAGIC_LIDR) return false;
 
     const uint16_t version = read_u16_le(p + 4);
-    // const uint16_t flags = read_u16_le(p + 6);  // reserved
-    const uint32_t count = read_u32_le(p + 8);
 
     std::size_t header_size = 0;
+    uint32_t count = 0;
+    bool has_flags = false;
 
     // Parsed fields
     int32_t stamp_sec = 0;
@@ -259,40 +259,69 @@ private:
     float range_min = 0.0f;
     float range_max = 0.0f;
 
-    if (version >= 2) {
-      // v2 header fixed size: 48 bytes
-      header_size = 48;
-      if (len < header_size) return false;
+    if (version >= 2 || version == 1) {
+      bool match_flags = false;
+      bool match_noflags = false;
+      std::size_t expected_flags = 0;
+      std::size_t expected_noflags = 0;
 
-      stamp_sec     = read_i32_le(p + 12);
-      stamp_nanosec = read_u32_le(p + 16);
+      if (len >= 12) {
+        const uint32_t count_flags = read_u32_le(p + 8);
+        const std::size_t header_flags = (version >= 2) ? 48 : 44;
+        expected_flags = header_flags + static_cast<std::size_t>(count_flags) * 4;
+        if (len >= expected_flags) {
+          match_flags = true;
+        }
+      }
 
-      angle_min      = read_f32_le(p + 20);
-      angle_max      = read_f32_le(p + 24);
-      angle_inc      = read_f32_le(p + 28);
-      time_increment = read_f32_le(p + 32);
-      scan_time      = read_f32_le(p + 36);
-      range_min      = read_f32_le(p + 40);
-      range_max      = read_f32_le(p + 44);
+      if (len >= 10) {
+        const uint32_t count_noflags = read_u32_le(p + 6);
+        const std::size_t header_noflags = (version >= 2) ? 46 : 42;
+        expected_noflags = header_noflags + static_cast<std::size_t>(count_noflags) * 4;
+        if (len >= expected_noflags) {
+          match_noflags = true;
+        }
+      }
 
-    } else if (version == 1) {
-      // Legacy v1 header: 44 bytes
-      header_size = 44;
-      if (len < header_size) return false;
+      if (match_noflags && (!match_flags || (expected_noflags == len && expected_flags != len))) {
+        has_flags = false;
+        count = read_u32_le(p + 6);
+        header_size = (version >= 2) ? 46 : 42;
+      } else if (match_flags) {
+        has_flags = true;
+        count = read_u32_le(p + 8);
+        header_size = (version >= 2) ? 48 : 44;
+      } else {
+        return false;
+      }
 
-      // float unity_stamp = read_f32_le(p + 12);  // legacy - ignore
+      const std::size_t base = has_flags ? 12 : 10;
 
-      angle_min      = read_f32_le(p + 16);
-      angle_max      = read_f32_le(p + 20);
-      angle_inc      = read_f32_le(p + 24);
-      time_increment = read_f32_le(p + 28);
-      scan_time      = read_f32_le(p + 32);
-      range_min      = read_f32_le(p + 36);
-      range_max      = read_f32_le(p + 40);
+      if (version >= 2) {
+        stamp_sec     = read_i32_le(p + base + 0);
+        stamp_nanosec = read_u32_le(p + base + 4);
 
-      // No stamp in v1 (or it's float unity time). We'll use ROS now for v1.
-      stamp_sec = 0;
-      stamp_nanosec = 0;
+        angle_min      = read_f32_le(p + base + 8);
+        angle_max      = read_f32_le(p + base + 12);
+        angle_inc      = read_f32_le(p + base + 16);
+        time_increment = read_f32_le(p + base + 20);
+        scan_time      = read_f32_le(p + base + 24);
+        range_min      = read_f32_le(p + base + 28);
+        range_max      = read_f32_le(p + base + 32);
+      } else {
+        // Legacy v1 header contains a float unity_stamp (ignored) after count
+        angle_min      = read_f32_le(p + base + 4);
+        angle_max      = read_f32_le(p + base + 8);
+        angle_inc      = read_f32_le(p + base + 12);
+        time_increment = read_f32_le(p + base + 16);
+        scan_time      = read_f32_le(p + base + 20);
+        range_min      = read_f32_le(p + base + 24);
+        range_max      = read_f32_le(p + base + 28);
+
+        // No stamp in v1 (or it's float unity time). We'll use ROS now for v1.
+        stamp_sec = 0;
+        stamp_nanosec = 0;
+      }
     } else {
       return false;
     }
