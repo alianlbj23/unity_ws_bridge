@@ -10,7 +10,10 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 
-add_executable(unity_ws_bridge_node src/unity_ws_bridge_node.cpp)
+add_executable(unity_ws_bridge_node
+  src/unity_ws_bridge_node.cpp
+  src/lidar_parser.cpp
+)
 target_include_directories(unity_ws_bridge_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
