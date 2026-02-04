@@ -31,6 +31,14 @@ static inline uint16_t read_u16_le(const uint8_t* p) {
 static inline uint32_t read_u32_le(const uint8_t* p) {
   return static_cast<uint32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
 }
+static inline int32_t read_i32_le(const uint8_t* p) {
+  return static_cast<int32_t>(
+    (uint32_t)p[0] |
+    ((uint32_t)p[1] << 8) |
+    ((uint32_t)p[2] << 16) |
+    ((uint32_t)p[3] << 24)
+  );
+}
 static inline float read_f32_le(const uint8_t* p) {
   uint32_t u = read_u32_le(p);
   float f;
@@ -48,10 +56,7 @@ public:
     declare_parameter<int>("port", 8765);
     declare_parameter<std::string>("scan_topic", "/scan");
     declare_parameter<std::string>("default_frame_id", "ms200k");
-    declare_parameter<bool>("use_ros_now_for_stamp", true);
-    declare_parameter<bool>("incoming_angles_in_degrees", false);
-    declare_parameter<double>("measurement_rate_hz", 0.0);
-    declare_parameter<double>("scan_rate_hz", 0.0);
+    declare_parameter<bool>("use_ros_now_for_stamp", false);
     declare_parameter<int>("accept_poll_ms", 100);
 
     bind_address_ = get_parameter("bind_address").as_string();
@@ -59,9 +64,6 @@ public:
     scan_topic_ = get_parameter("scan_topic").as_string();
     default_frame_id_ = get_parameter("default_frame_id").as_string();
     use_ros_now_for_stamp_ = get_parameter("use_ros_now_for_stamp").as_bool();
-    incoming_angles_in_degrees_ = get_parameter("incoming_angles_in_degrees").as_bool();
-    measurement_rate_hz_ = get_parameter("measurement_rate_hz").as_double();
-    scan_rate_hz_ = get_parameter("scan_rate_hz").as_double();
     accept_poll_ms_ = std::max(10, static_cast<int>(get_parameter("accept_poll_ms").as_int()));
 
     pub_scan_ = create_publisher<sensor_msgs::msg::LaserScan>(scan_topic_, rclcpp::SensorDataQoS());
@@ -72,9 +74,9 @@ public:
     server_thread_ = std::thread([this]() { run_server(); });
 
     RCLCPP_INFO(get_logger(),
-      "WebSocket server: ws://%s:%d  publishing: %s (accept_poll=%dms, deg=%s)",
+      "WebSocket server: ws://%s:%d  publishing: %s (accept_poll=%dms, use_ros_now_for_stamp=%s)",
       bind_address_.c_str(), port_, scan_topic_.c_str(), accept_poll_ms_,
-      incoming_angles_in_degrees_ ? "true" : "false");
+      use_ros_now_for_stamp_ ? "true" : "false");
   }
 
   ~UnityWsLidarBridge() override
@@ -234,31 +236,65 @@ private:
 
   bool parse_and_publish_lidar(const uint8_t* p, std::size_t len)
   {
-    // Unity header fixed layout = 36 bytes
-    if (len < 36) return false;
+    if (len < 12) return false;
 
     const uint32_t magic = read_u32_le(p + 0);
     if (magic != MAGIC_LIDR) return false;
 
     const uint16_t version = read_u16_le(p + 4);
+    // const uint16_t flags = read_u16_le(p + 6);  // reserved
     const uint32_t count = read_u32_le(p + 8);
 
-    const float unity_stamp = read_f32_le(p + 12);
-    const float angle_min   = read_f32_le(p + 16);
-    const float angle_max   = read_f32_le(p + 20);
-    const float angle_inc   = read_f32_le(p + 24);
-    const float range_min   = read_f32_le(p + 28);
-    const float range_max   = read_f32_le(p + 32);
+    std::size_t header_size = 0;
 
+    // Parsed fields
+    int32_t stamp_sec = 0;
+    uint32_t stamp_nanosec = 0;
+
+    float angle_min = 0.0f;
+    float angle_max = 0.0f;
+    float angle_inc = 0.0f;
     float time_increment = 0.0f;
     float scan_time = 0.0f;
+    float range_min = 0.0f;
+    float range_max = 0.0f;
 
-    std::size_t header_size = 36;
     if (version >= 2) {
+      // v2 header fixed size: 48 bytes
+      header_size = 48;
+      if (len < header_size) return false;
+
+      stamp_sec     = read_i32_le(p + 12);
+      stamp_nanosec = read_u32_le(p + 16);
+
+      angle_min      = read_f32_le(p + 20);
+      angle_max      = read_f32_le(p + 24);
+      angle_inc      = read_f32_le(p + 28);
+      time_increment = read_f32_le(p + 32);
+      scan_time      = read_f32_le(p + 36);
+      range_min      = read_f32_le(p + 40);
+      range_max      = read_f32_le(p + 44);
+
+    } else if (version == 1) {
+      // Legacy v1 header: 44 bytes
       header_size = 44;
       if (len < header_size) return false;
-      time_increment = read_f32_le(p + 36);
-      scan_time = read_f32_le(p + 40);
+
+      // float unity_stamp = read_f32_le(p + 12);  // legacy - ignore
+
+      angle_min      = read_f32_le(p + 16);
+      angle_max      = read_f32_le(p + 20);
+      angle_inc      = read_f32_le(p + 24);
+      time_increment = read_f32_le(p + 28);
+      scan_time      = read_f32_le(p + 32);
+      range_min      = read_f32_le(p + 36);
+      range_max      = read_f32_le(p + 40);
+
+      // No stamp in v1 (or it's float unity time). We'll use ROS now for v1.
+      stamp_sec = 0;
+      stamp_nanosec = 0;
+    } else {
+      return false;
     }
 
     const std::size_t expected = header_size + static_cast<std::size_t>(count) * 4;
@@ -273,40 +309,28 @@ private:
     sensor_msgs::msg::LaserScan msg;
     msg.header.frame_id = default_frame_id_;
 
-    // Unity stamp is Time.time (not epoch). Use ROS now by default.
-    if (use_ros_now_for_stamp_) {
-      msg.header.stamp = this->now();
+    // Stamp policy:
+    // - For v2, prefer Unity-provided (SimClock-based) stamp unless user forces ROS now.
+    // - For v1, always use ROS now.
+    if (version >= 2 && !use_ros_now_for_stamp_) {
+      msg.header.stamp.sec = stamp_sec;
+      msg.header.stamp.nanosec = stamp_nanosec;
     } else {
       msg.header.stamp = this->now();
-      (void)unity_stamp;
-    }
-    if (incoming_angles_in_degrees_) {
-      const float deg2rad = static_cast<float>(std::acos(-1.0) / 180.0);
-      msg.angle_min = angle_min * deg2rad;
-      msg.angle_max = angle_max * deg2rad;
-      msg.angle_increment = angle_inc * deg2rad;
-    } else {
-      msg.angle_min = angle_min;
-      msg.angle_max = angle_max;
-      msg.angle_increment = angle_inc;
     }
 
-    // If Unity normalized angle_max to 0 (e.g., 360 -> 0), reconstruct from increment
-    if (count > 1 && msg.angle_increment > 0.0f && msg.angle_max == msg.angle_min) {
+    msg.angle_min = angle_min;
+    msg.angle_max = angle_max;
+    msg.angle_increment = angle_inc;
+
+    // Safety: reconstruct angle_max if degenerate
+    if (count > 1 && msg.angle_increment > 0.0f &&
+        std::fabs(msg.angle_max - msg.angle_min) < 1e-6f) {
       msg.angle_max = msg.angle_min + msg.angle_increment * static_cast<float>(count - 1);
     }
 
-    if (version >= 2) {
-      msg.time_increment = time_increment;
-      msg.scan_time = scan_time;
-    } else {
-      msg.time_increment = (measurement_rate_hz_ > 0.0)
-        ? static_cast<float>(1.0 / measurement_rate_hz_)
-        : 0.0f;
-      msg.scan_time = (scan_rate_hz_ > 0.0)
-        ? static_cast<float>(1.0 / scan_rate_hz_)
-        : 0.0f;
-    }
+    msg.time_increment = time_increment;
+    msg.scan_time = scan_time;
 
     msg.range_min = range_min;
     msg.range_max = range_max;
@@ -326,9 +350,6 @@ private:
   std::string scan_topic_;
   std::string default_frame_id_;
   bool use_ros_now_for_stamp_;
-  bool incoming_angles_in_degrees_;
-  double measurement_rate_hz_;
-  double scan_rate_hz_;
 
   int accept_poll_ms_;
 
