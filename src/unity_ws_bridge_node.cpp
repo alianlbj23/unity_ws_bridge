@@ -49,6 +49,9 @@ public:
     declare_parameter<std::string>("scan_topic", "/scan");
     declare_parameter<std::string>("default_frame_id", "ms200k");
     declare_parameter<bool>("use_ros_now_for_stamp", true);
+    declare_parameter<bool>("incoming_angles_in_degrees", false);
+    declare_parameter<double>("measurement_rate_hz", 0.0);
+    declare_parameter<double>("scan_rate_hz", 0.0);
     declare_parameter<int>("accept_poll_ms", 100);
 
     bind_address_ = get_parameter("bind_address").as_string();
@@ -56,6 +59,9 @@ public:
     scan_topic_ = get_parameter("scan_topic").as_string();
     default_frame_id_ = get_parameter("default_frame_id").as_string();
     use_ros_now_for_stamp_ = get_parameter("use_ros_now_for_stamp").as_bool();
+    incoming_angles_in_degrees_ = get_parameter("incoming_angles_in_degrees").as_bool();
+    measurement_rate_hz_ = get_parameter("measurement_rate_hz").as_double();
+    scan_rate_hz_ = get_parameter("scan_rate_hz").as_double();
     accept_poll_ms_ = std::max(10, static_cast<int>(get_parameter("accept_poll_ms").as_int()));
 
     pub_scan_ = create_publisher<sensor_msgs::msg::LaserScan>(scan_topic_, rclcpp::SensorDataQoS());
@@ -66,8 +72,9 @@ public:
     server_thread_ = std::thread([this]() { run_server(); });
 
     RCLCPP_INFO(get_logger(),
-      "WebSocket server: ws://%s:%d  publishing: %s (accept_poll=%dms)",
-      bind_address_.c_str(), port_, scan_topic_.c_str(), accept_poll_ms_);
+      "WebSocket server: ws://%s:%d  publishing: %s (accept_poll=%dms, deg=%s)",
+      bind_address_.c_str(), port_, scan_topic_.c_str(), accept_poll_ms_,
+      incoming_angles_in_degrees_ ? "true" : "false");
   }
 
   ~UnityWsLidarBridge() override
@@ -233,7 +240,7 @@ private:
     const uint32_t magic = read_u32_le(p + 0);
     if (magic != MAGIC_LIDR) return false;
 
-    (void)read_u16_le(p + 4); // version
+    const uint16_t version = read_u16_le(p + 4);
     const uint32_t count = read_u32_le(p + 8);
 
     const float unity_stamp = read_f32_le(p + 12);
@@ -243,11 +250,22 @@ private:
     const float range_min   = read_f32_le(p + 28);
     const float range_max   = read_f32_le(p + 32);
 
-    const std::size_t expected = 36 + static_cast<std::size_t>(count) * 4;
+    float time_increment = 0.0f;
+    float scan_time = 0.0f;
+
+    std::size_t header_size = 36;
+    if (version >= 2) {
+      header_size = 44;
+      if (len < header_size) return false;
+      time_increment = read_f32_le(p + 36);
+      scan_time = read_f32_le(p + 40);
+    }
+
+    const std::size_t expected = header_size + static_cast<std::size_t>(count) * 4;
     if (len < expected) return false;
 
     std::vector<float> ranges(count);
-    const uint8_t* pr = p + 36;
+    const uint8_t* pr = p + header_size;
     for (uint32_t i = 0; i < count; i++) {
       ranges[i] = read_f32_le(pr + i * 4);
     }
@@ -262,13 +280,33 @@ private:
       msg.header.stamp = this->now();
       (void)unity_stamp;
     }
+    if (incoming_angles_in_degrees_) {
+      const float deg2rad = static_cast<float>(std::acos(-1.0) / 180.0);
+      msg.angle_min = angle_min * deg2rad;
+      msg.angle_max = angle_max * deg2rad;
+      msg.angle_increment = angle_inc * deg2rad;
+    } else {
+      msg.angle_min = angle_min;
+      msg.angle_max = angle_max;
+      msg.angle_increment = angle_inc;
+    }
 
-    msg.angle_min = angle_min;
-    msg.angle_max = angle_max;
-    msg.angle_increment = angle_inc;
+    // If Unity normalized angle_max to 0 (e.g., 360 -> 0), reconstruct from increment
+    if (count > 1 && msg.angle_increment > 0.0f && msg.angle_max == msg.angle_min) {
+      msg.angle_max = msg.angle_min + msg.angle_increment * static_cast<float>(count - 1);
+    }
 
-    msg.scan_time = 0.0f;
-    msg.time_increment = 0.0f;
+    if (version >= 2) {
+      msg.time_increment = time_increment;
+      msg.scan_time = scan_time;
+    } else {
+      msg.time_increment = (measurement_rate_hz_ > 0.0)
+        ? static_cast<float>(1.0 / measurement_rate_hz_)
+        : 0.0f;
+      msg.scan_time = (scan_rate_hz_ > 0.0)
+        ? static_cast<float>(1.0 / scan_rate_hz_)
+        : 0.0f;
+    }
 
     msg.range_min = range_min;
     msg.range_max = range_max;
@@ -288,6 +326,9 @@ private:
   std::string scan_topic_;
   std::string default_frame_id_;
   bool use_ros_now_for_stamp_;
+  bool incoming_angles_in_degrees_;
+  double measurement_rate_hz_;
+  double scan_rate_hz_;
 
   int accept_poll_ms_;
 
