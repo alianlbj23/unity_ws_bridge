@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 
 #include "unity_ws_bridge/lidar_parser.hpp"
 
@@ -10,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -21,15 +23,16 @@ namespace websocket = beast::websocket;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-class UnityWsLidarBridge : public rclcpp::Node
+class UnityWsBridge : public rclcpp::Node
 {
 public:
-  UnityWsLidarBridge()
-  : Node("unity_ws_lidar_bridge")
+  UnityWsBridge()
+  : Node("unity_ws_bridge")
   {
     declare_parameter<std::string>("bind_address", "0.0.0.0");
     declare_parameter<int>("port", 8765);
     declare_parameter<std::string>("scan_topic", "/scan");
+    declare_parameter<std::string>("ros_float_array_topic", "/car_C_front_wheel");
     declare_parameter<std::string>("default_frame_id", "ms200k");
     declare_parameter<bool>("use_ros_now_for_stamp", false);
     declare_parameter<int>("accept_poll_ms", 100);
@@ -37,11 +40,17 @@ public:
     bind_address_ = get_parameter("bind_address").as_string();
     port_ = get_parameter("port").as_int();
     scan_topic_ = get_parameter("scan_topic").as_string();
+    ros_float_array_topic_ = get_parameter("ros_float_array_topic").as_string();
     default_frame_id_ = get_parameter("default_frame_id").as_string();
     use_ros_now_for_stamp_ = get_parameter("use_ros_now_for_stamp").as_bool();
     accept_poll_ms_ = std::max(10, static_cast<int>(get_parameter("accept_poll_ms").as_int()));
 
     pub_scan_ = create_publisher<sensor_msgs::msg::LaserScan>(scan_topic_, rclcpp::SensorDataQoS());
+    sub_float_array_ = create_subscription<std_msgs::msg::Float32MultiArray>(
+      ros_float_array_topic_, rclcpp::SensorDataQoS(),
+      [this](const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+        forward_float32_array_to_unity(*msg);
+      });
 
     // Ensure shutdown() is called when Ctrl+C triggers ROS shutdown
     rclcpp::on_shutdown([this]() { shutdown(); });
@@ -49,12 +58,12 @@ public:
     server_thread_ = std::thread([this]() { run_server(); });
 
     RCLCPP_INFO(get_logger(),
-      "WebSocket server: ws://%s:%d  publishing: %s (accept_poll=%dms, use_ros_now_for_stamp=%s)",
-      bind_address_.c_str(), port_, scan_topic_.c_str(), accept_poll_ms_,
+      "WebSocket server: ws://%s:%d  publishing: %s, forwarding: %s (accept_poll=%dms, use_ros_now_for_stamp=%s)",
+      bind_address_.c_str(), port_, scan_topic_.c_str(), ros_float_array_topic_.c_str(), accept_poll_ms_,
       use_ros_now_for_stamp_ ? "true" : "false");
   }
 
-  ~UnityWsLidarBridge() override
+  ~UnityWsBridge() override
   {
     shutdown();
     if (server_thread_.joinable()) server_thread_.join();
@@ -125,7 +134,7 @@ private:
           continue;
         }
 
-        std::thread(&UnityWsLidarBridge::handle_session, this, std::move(socket)).detach();
+        std::thread(&UnityWsBridge::handle_session, this, std::move(socket)).detach();
       }
     } catch (const std::exception& e) {
       if (!shutting_down_) {
@@ -225,12 +234,51 @@ private:
     return true;
   }
 
+  static inline void write_f32_le(uint8_t* dst, float v)
+  {
+    uint32_t u;
+    std::memcpy(&u, &v, sizeof(uint32_t));
+    dst[0] = static_cast<uint8_t>(u & 0xFF);
+    dst[1] = static_cast<uint8_t>((u >> 8) & 0xFF);
+    dst[2] = static_cast<uint8_t>((u >> 16) & 0xFF);
+    dst[3] = static_cast<uint8_t>((u >> 24) & 0xFF);
+  }
+
+  void forward_float32_array_to_unity(const std_msgs::msg::Float32MultiArray& msg)
+  {
+    std::vector<std::shared_ptr<websocket::stream<tcp::socket>>> sessions_copy;
+    {
+      std::lock_guard<std::mutex> lock(sessions_mutex_);
+      if (sessions_.empty()) return;
+      sessions_copy = sessions_;
+    }
+
+    const std::size_t count = msg.data.size();
+    std::vector<uint8_t> payload(count * 4);
+    for (std::size_t i = 0; i < count; ++i) {
+      write_f32_le(payload.data() + i * 4, msg.data[i]);
+    }
+
+    std::lock_guard<std::mutex> write_lock(ws_write_mutex_);
+    for (auto& ws : sessions_copy) {
+      if (!ws) continue;
+      boost::system::error_code ec;
+      ws->binary(true);
+      ws->write(net::buffer(payload), ec);
+      if (ec) {
+        RCLCPP_DEBUG(get_logger(), "Unity send error: %s", ec.message().c_str());
+      }
+    }
+  }
+
 private:
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr pub_scan_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr sub_float_array_;
 
   std::string bind_address_;
   int port_;
   std::string scan_topic_;
+  std::string ros_float_array_topic_;
   std::string default_frame_id_;
   bool use_ros_now_for_stamp_;
 
@@ -243,13 +291,14 @@ private:
   std::atomic<bool> shutting_down_{false};
 
   std::mutex sessions_mutex_;
+  std::mutex ws_write_mutex_;
   std::vector<std::shared_ptr<websocket::stream<tcp::socket>>> sessions_;
 };
 
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<UnityWsLidarBridge>());
+  rclcpp::spin(std::make_shared<UnityWsBridge>());
   rclcpp::shutdown();
   return 0;
 }
